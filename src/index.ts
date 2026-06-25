@@ -1,584 +1,207 @@
-import { execSync } from 'child_process';
-import fs from 'fs';
+/**
+ * NanoClaw — main entry point.
+ *
+ * Thin orchestrator: init DB, run migrations, start channel adapters,
+ * start delivery polls, start sweep, handle shutdown.
+ */
 import path from 'path';
 
+import { backfillContainerConfigs } from './backfill-container-configs.js';
+import { DATA_DIR } from './config.js';
+import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
+import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
+import { initDb } from './db/connection.js';
+import { runMigrations } from './db/migrations/index.js';
+import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
+import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
+import { startHostSweep, stopHostSweep } from './host-sweep.js';
+import { routeInbound } from './router.js';
+import { log } from './log.js';
+import { enforceUpgradeTripwire } from './upgrade-state.js';
+
+// Response + shutdown registries live in response-registry.ts to break the
+// circular import cycle: src/index.ts imports src/modules/index.js for side
+// effects, and the modules call registerResponseHandler/onShutdown at top
+// level — which would hit a TDZ error if the arrays lived here. Re-exported
+// here so existing callers see the same surface.
 import {
-  ASSISTANT_NAME,
-  DATA_DIR,
-  IDLE_TIMEOUT,
-  MAIN_GROUP_FOLDER,
-  NANOCLAW_CHANNEL,
-  POLL_INTERVAL,
-  TRIGGER_PATTERN,
-} from './config.js';
-import { SlackChannel } from './channels/slack.js';
-import { WhatsAppChannel } from './channels/whatsapp.js';
+  registerResponseHandler,
+  getResponseHandlers,
+  onShutdown,
+  getShutdownCallbacks,
+  type ResponsePayload,
+  type ResponseHandler,
+} from './response-registry.js';
+export { registerResponseHandler, onShutdown };
+export type { ResponsePayload, ResponseHandler };
+
+async function dispatchResponse(payload: ResponsePayload): Promise<void> {
+  for (const handler of getResponseHandlers()) {
+    try {
+      const claimed = await handler(payload);
+      if (claimed) return;
+    } catch (err) {
+      log.error('Response handler threw', { questionId: payload.questionId, err });
+    }
+  }
+  log.warn('Unclaimed response', { questionId: payload.questionId, value: payload.value });
+}
+
+// Channel barrel — each enabled channel self-registers on import.
+// Channel skills uncomment lines in channels/index.ts to enable them.
+import './channels/index.js';
+
+// Modules barrel — default modules (typing, mount-security) ship here; skills
+// append registry-based modules. Imported for side effects (registrations).
+import './modules/index.js';
+
+// CLI command barrel — populates the `ncl` registry before the CLI server
+// accepts connections.
+import './cli/commands/index.js';
+import './cli/delivery-action.js';
+import { startCliServer, stopCliServer } from './cli/socket-server.js';
+
+import type { ChannelAdapter, ChannelSetup } from './channels/adapter.js';
 import {
-  ContainerOutput,
-  runContainerAgent,
-  writeGroupsSnapshot,
-  writeTasksSnapshot,
-} from './container-runner.js';
-import {
-  getAllChats,
-  getAllRegisteredGroups,
-  getAllSessions,
-  getAllTasks,
-  getMessagesSince,
-  getNewMessages,
-  getRouterState,
-  initDatabase,
-  setRegisteredGroup,
-  setRouterState,
-  setSession,
-  storeChatMetadata,
-  storeMessage,
-} from './db.js';
-import { GroupQueue } from './group-queue.js';
-import { startIpcWatcher } from './ipc.js';
-import { formatMessages, formatOutbound } from './router.js';
-import { startSchedulerLoop } from './task-scheduler.js';
-import { NewMessage, RegisteredGroup, Channel } from './types.js';
-import { logger } from './logger.js';
-
-// Global error handlers to prevent crashes from unhandled rejections/exceptions
-// See: https://github.com/qwibitai/nanoclaw/issues/221
-process.on('unhandledRejection', (reason, promise) => {
-  logger.error(
-    { reason: reason instanceof Error ? reason.message : String(reason) },
-    'Unhandled promise rejection - application will continue',
-  );
-  // Log the promise that was rejected for debugging
-  if (promise && typeof promise.catch === 'function') {
-    promise.catch((err) => {
-      logger.error({ err }, 'Promise rejection details');
-    });
-  }
-});
-
-process.on('uncaughtException', (err) => {
-  logger.error(
-    { err: err.message, stack: err.stack },
-    'Uncaught exception - attempting graceful shutdown',
-  );
-  // Attempt graceful shutdown before exiting
-  shutdown().finally(() => {
-    process.exit(1);
-  });
-});
-
-// Top-level shutdown function for global error handlers
-let shutdownFn: (() => Promise<void>) | null = null;
-async function shutdown(): Promise<void> {
-  if (shutdownFn) {
-    await shutdownFn();
-  } else {
-    logger.warn('Shutdown called before initialization, forcing exit');
-    process.exit(1);
-  }
-}
-
-// Re-export for backwards compatibility during refactor
-export { escapeXml, formatMessages } from './router.js';
-
-let lastTimestamp = '';
-let sessions: Record<string, string> = {};
-let registeredGroups: Record<string, RegisteredGroup> = {};
-let lastAgentTimestamp: Record<string, string> = {};
-let messageLoopRunning = false;
-
-let appChannel: Channel;
-const queue = new GroupQueue();
-
-function loadState(): void {
-  lastTimestamp = getRouterState('last_timestamp') || '';
-  const agentTs = getRouterState('last_agent_timestamp');
-  try {
-    lastAgentTimestamp = agentTs ? JSON.parse(agentTs) : {};
-  } catch {
-    logger.warn('Corrupted last_agent_timestamp in DB, resetting');
-    lastAgentTimestamp = {};
-  }
-  sessions = getAllSessions();
-  registeredGroups = getAllRegisteredGroups();
-  logger.info(
-    { groupCount: Object.keys(registeredGroups).length },
-    'State loaded',
-  );
-}
-
-function saveState(): void {
-  setRouterState('last_timestamp', lastTimestamp);
-  setRouterState(
-    'last_agent_timestamp',
-    JSON.stringify(lastAgentTimestamp),
-  );
-}
-
-function registerGroup(jid: string, group: RegisteredGroup): void {
-  registeredGroups[jid] = group;
-  setRegisteredGroup(jid, group);
-
-  // Create group folder
-  const groupDir = path.join(DATA_DIR, '..', 'groups', group.folder);
-  fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
-
-  logger.info(
-    { jid, name: group.name, folder: group.folder },
-    'Group registered',
-  );
-}
-
-/**
- * Get available groups list for the agent.
- * Returns groups ordered by most recent activity.
- */
-export function getAvailableGroups(): import('./container-runner.js').AvailableGroup[] {
-  const chats = getAllChats();
-  const registeredJids = new Set(Object.keys(registeredGroups));
-
-  return chats
-    .filter((c) => c.jid !== '__group_sync__' && c.jid.endsWith('@g.us'))
-    .map((c) => ({
-      jid: c.jid,
-      name: c.name,
-      lastActivity: c.last_message_time,
-      isRegistered: registeredJids.has(c.jid),
-    }));
-}
-
-/** @internal - exported for testing */
-export function _setRegisteredGroups(groups: Record<string, RegisteredGroup>): void {
-  registeredGroups = groups;
-}
-
-/**
- * Process all pending messages for a group.
- * Called by the GroupQueue when it's this group's turn.
- */
-async function processGroupMessages(chatJid: string): Promise<boolean> {
-  const group = registeredGroups[chatJid];
-  if (!group) return true;
-
-  const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
-
-  const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-  const missedMessages = getMessagesSince(
-    chatJid,
-    sinceTimestamp,
-    ASSISTANT_NAME,
-  );
-
-  if (missedMessages.length === 0) return true;
-
-  // For non-main groups, check if trigger is required and present
-  if (!isMainGroup && group.requiresTrigger !== false) {
-    const hasTrigger = missedMessages.some((m) =>
-      TRIGGER_PATTERN.test(m.content.trim()),
-    );
-    if (!hasTrigger) return true;
-  }
-
-  const prompt = formatMessages(missedMessages);
-
-  // Advance cursor so the piping path in startMessageLoop won't re-fetch
-  // these messages. Save the old cursor so we can roll back on error.
-  const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] =
-    missedMessages[missedMessages.length - 1].timestamp;
-  saveState();
-
-  logger.info(
-    { group: group.name, messageCount: missedMessages.length },
-    'Processing messages',
-  );
-
-  // Track idle timer for closing stdin when agent is idle
-  let idleTimer: ReturnType<typeof setTimeout> | null = null;
-
-  const resetIdleTimer = () => {
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      logger.debug({ group: group.name }, 'Idle timeout, closing container stdin');
-      queue.closeStdin(chatJid);
-    }, IDLE_TIMEOUT);
-  };
-
-  await appChannel.setTyping?.(chatJid, true);
-  let hadError = false;
-  let outputSentToUser = false;
-
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
-    // Wrap in try/catch to prevent unhandled rejections
-    try {
-      if (result.result) {
-        const raw = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
-        // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-        logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
-        if (text) {
-          await appChannel.sendMessage(chatJid, `${appChannel.prefixAssistantName !== false ? `${ASSISTANT_NAME}: ` : ''}${text}`);
-          outputSentToUser = true;
-        }
-        // Only reset idle timer on actual results, not session-update markers (result: null)
-        resetIdleTimer();
-      }
-
-      if (result.status === 'error') {
-        hadError = true;
-      }
-    } catch (err) {
-      logger.error({ group: group.name, err }, 'Error in streaming output callback');
-      hadError = true;
-    }
-  });
-
-  await appChannel.setTyping?.(chatJid, false);
-  if (idleTimer) clearTimeout(idleTimer);
-
-  if (output === 'error' || hadError) {
-    // If we already sent output to the user, don't roll back the cursor —
-    // the user got their response and re-processing would send duplicates.
-    if (outputSentToUser) {
-      logger.warn({ group: group.name }, 'Agent error after output was sent, skipping cursor rollback to prevent duplicates');
-      return true;
-    }
-    // Roll back cursor so retries can re-process these messages
-    lastAgentTimestamp[chatJid] = previousCursor;
-    saveState();
-    logger.warn({ group: group.name }, 'Agent error, rolled back message cursor for retry');
-    return false;
-  }
-
-  return true;
-}
-
-async function runAgent(
-  group: RegisteredGroup,
-  prompt: string,
-  chatJid: string,
-  onOutput?: (output: ContainerOutput) => Promise<void>,
-): Promise<'success' | 'error'> {
-  const isMain = group.folder === MAIN_GROUP_FOLDER;
-  const sessionId = sessions[group.folder];
-
-  // Update tasks snapshot for container to read (filtered by group)
-  const tasks = getAllTasks();
-  writeTasksSnapshot(
-    group.folder,
-    isMain,
-    tasks.map((t) => ({
-      id: t.id,
-      groupFolder: t.group_folder,
-      prompt: t.prompt,
-      schedule_type: t.schedule_type,
-      schedule_value: t.schedule_value,
-      status: t.status,
-      next_run: t.next_run,
-    })),
-  );
-
-  // Update available groups snapshot (main group only can see all groups)
-  const availableGroups = getAvailableGroups();
-  writeGroupsSnapshot(
-    group.folder,
-    isMain,
-    availableGroups,
-    new Set(Object.keys(registeredGroups)),
-  );
-
-  // Wrap onOutput to track session ID from streamed results
-  const wrappedOnOutput = onOutput
-    ? async (output: ContainerOutput) => {
-        if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
-        }
-        await onOutput(output);
-      }
-    : undefined;
-
-  try {
-    const output = await runContainerAgent(
-      group,
-      {
-        prompt,
-        sessionId,
-        groupFolder: group.folder,
-        chatJid,
-        isMain,
-      },
-      (proc, containerName) => queue.registerProcess(chatJid, proc, containerName, group.folder),
-      wrappedOnOutput,
-    );
-
-    if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
-    }
-
-    if (output.status === 'error') {
-      logger.error(
-        { group: group.name, error: output.error },
-        'Container agent error',
-      );
-      return 'error';
-    }
-
-    return 'success';
-  } catch (err) {
-    logger.error({ group: group.name, err }, 'Agent error');
-    return 'error';
-  }
-}
-
-async function startMessageLoop(): Promise<void> {
-  if (messageLoopRunning) {
-    logger.debug('Message loop already running, skipping duplicate start');
-    return;
-  }
-  messageLoopRunning = true;
-
-  logger.info(`NanoClaw running (trigger: @${ASSISTANT_NAME})`);
-
-  while (true) {
-    try {
-      const jids = Object.keys(registeredGroups);
-      const { messages, newTimestamp } = getNewMessages(
-        jids,
-        lastTimestamp,
-        ASSISTANT_NAME,
-      );
-
-      if (messages.length > 0) {
-        logger.info({ count: messages.length }, 'New messages');
-
-        // Advance the "seen" cursor for all messages immediately
-        lastTimestamp = newTimestamp;
-        saveState();
-
-        // Deduplicate by group
-        const messagesByGroup = new Map<string, NewMessage[]>();
-        for (const msg of messages) {
-          const existing = messagesByGroup.get(msg.chat_jid);
-          if (existing) {
-            existing.push(msg);
-          } else {
-            messagesByGroup.set(msg.chat_jid, [msg]);
-          }
-        }
-
-        for (const [chatJid, groupMessages] of messagesByGroup) {
-          const group = registeredGroups[chatJid];
-          if (!group) continue;
-
-          const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
-          const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
-
-          // For non-main groups, only act on trigger messages.
-          // Non-trigger messages accumulate in DB and get pulled as
-          // context when a trigger eventually arrives.
-          if (needsTrigger) {
-            const hasTrigger = groupMessages.some((m) =>
-              TRIGGER_PATTERN.test(m.content.trim()),
-            );
-            if (!hasTrigger) continue;
-          }
-
-          // Pull all messages since lastAgentTimestamp so non-trigger
-          // context that accumulated between triggers is included.
-          const allPending = getMessagesSince(
-            chatJid,
-            lastAgentTimestamp[chatJid] || '',
-            ASSISTANT_NAME,
-          );
-          const messagesToSend =
-            allPending.length > 0 ? allPending : groupMessages;
-          const formatted = formatMessages(messagesToSend);
-
-          if (queue.sendMessage(chatJid, formatted)) {
-            logger.debug(
-              { chatJid, count: messagesToSend.length },
-              'Piped messages to active container',
-            );
-            lastAgentTimestamp[chatJid] =
-              messagesToSend[messagesToSend.length - 1].timestamp;
-            saveState();
-            // Show typing indicator while the container processes the piped message
-            appChannel.setTyping?.(chatJid, true);
-          } else {
-            // No active container — enqueue for a new one
-            queue.enqueueMessageCheck(chatJid);
-          }
-        }
-      }
-    } catch (err) {
-      logger.error({ err }, 'Error in message loop');
-    }
-    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
-  }
-}
-
-/**
- * Startup recovery: check for unprocessed messages in registered groups.
- * Handles crash between advancing lastTimestamp and processing messages.
- */
-function recoverPendingMessages(): void {
-  for (const [chatJid, group] of Object.entries(registeredGroups)) {
-    const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-    const pending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
-    if (pending.length > 0) {
-      logger.info(
-        { group: group.name, pendingCount: pending.length },
-        'Recovery: found unprocessed messages',
-      );
-      queue.enqueueMessageCheck(chatJid);
-    }
-  }
-}
-
-function ensureContainerSystemRunning(): void {
-  try {
-    execSync('container system status', { stdio: 'pipe' });
-    logger.debug('Apple Container system already running');
-  } catch {
-    logger.info('Starting Apple Container system...');
-    try {
-      execSync('container system start', { stdio: 'pipe', timeout: 30000 });
-      logger.info('Apple Container system started');
-    } catch (err) {
-      logger.error({ err }, 'Failed to start Apple Container system');
-      console.error(
-        '\n╔════════════════════════════════════════════════════════════════╗',
-      );
-      console.error(
-        '║  FATAL: Apple Container system failed to start                 ║',
-      );
-      console.error(
-        '║                                                                ║',
-      );
-      console.error(
-        '║  Agents cannot run without Apple Container. To fix:           ║',
-      );
-      console.error(
-        '║  1. Install from: https://github.com/apple/container/releases ║',
-      );
-      console.error(
-        '║  2. Run: container system start                               ║',
-      );
-      console.error(
-        '║  3. Restart NanoClaw                                          ║',
-      );
-      console.error(
-        '╚════════════════════════════════════════════════════════════════╝\n',
-      );
-      throw new Error('Apple Container system is required but failed to start');
-    }
-  }
-
-  // Kill and clean up orphaned NanoClaw containers from previous runs
-  try {
-    const output = execSync('container ls --format json', {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      encoding: 'utf-8',
-    });
-    const containers: { status: string; configuration: { id: string } }[] = JSON.parse(output || '[]');
-    const orphans = containers
-      .filter((c) => c.status === 'running' && c.configuration.id.startsWith('nanoclaw-'))
-      .map((c) => c.configuration.id);
-    for (const name of orphans) {
-      try {
-        execSync(`container stop ${name}`, { stdio: 'pipe' });
-      } catch { /* already stopped */ }
-    }
-    if (orphans.length > 0) {
-      logger.info({ count: orphans.length, names: orphans }, 'Stopped orphaned containers');
-    }
-  } catch (err) {
-    logger.warn({ err }, 'Failed to clean up orphaned containers');
-  }
-}
+  initChannelAdapters,
+  teardownChannelAdapters,
+  createChannelDeliveryAdapter,
+} from './channels/channel-registry.js';
 
 async function main(): Promise<void> {
-  ensureContainerSystemRunning();
-  initDatabase();
-  logger.info('Database initialized');
-  loadState();
+  log.info('NanoClaw starting');
 
-  // Graceful shutdown handlers
-  const shutdown = async (signal: string) => {
-    logger.info({ signal }, 'Shutdown signal received');
-    await queue.shutdown(10000);
-    await appChannel.disconnect();
-    process.exit(0);
-  };
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
+  // 0. Circuit breaker — backoff on rapid restarts
+  await enforceStartupBackoff();
 
-  // Register shutdown function for global error handlers
-  shutdownFn = () => shutdown('SHUTDOWN_SIGNAL');
+  // 0.5 Upgrade tripwire — refuse to start if this install was updated
+  // outside the sanctioned path (raw `git pull` instead of /update-nanoclaw).
+  enforceUpgradeTripwire();
 
-  // Create channel based on configuration
-  if (NANOCLAW_CHANNEL === 'slack') {
-    logger.info('Using Slack channel');
-    appChannel = new SlackChannel({
-      onMessage: (chatJid, msg) => storeMessage(msg),
-      onChatMetadata: (chatJid, timestamp, name) => storeChatMetadata(chatJid, timestamp, name),
-      registeredGroups: () => registeredGroups,
-    });
-  } else {
-    if (NANOCLAW_CHANNEL !== 'whatsapp') {
-      logger.warn({ channel: NANOCLAW_CHANNEL }, 'Unknown channel type, defaulting to WhatsApp');
+  // 1. Init central DB
+  const dbPath = path.join(DATA_DIR, 'v2.db');
+  const db = initDb(dbPath);
+  runMigrations(db);
+  log.info('Central DB ready', { path: dbPath });
+
+  // 1b. Backfill container_configs from legacy container.json files.
+  // Idempotent — skips groups that already have a config row.
+  backfillContainerConfigs();
+
+  // 1c. One-time filesystem cutover — idempotent, no-op after first run.
+  migrateGroupsToClaudeLocal();
+
+  // 2. Container runtime
+  ensureContainerRuntimeRunning();
+  cleanupOrphans();
+
+  // 3. Channel adapters
+  await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
+    return {
+      onInbound(platformId, threadId, message) {
+        routeInbound({
+          channelType: adapter.channelType,
+          // The one host-side stamping seam: adapters stay instance-blind,
+          // the host stamps the receiving instance on every inbound event.
+          instance: adapter.instance ?? adapter.channelType,
+          platformId,
+          threadId,
+          message: {
+            id: message.id,
+            kind: message.kind,
+            content: JSON.stringify(message.content),
+            timestamp: message.timestamp,
+            isMention: message.isMention,
+            isGroup: message.isGroup,
+          },
+        }).catch((err) => {
+          log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
+        });
+      },
+      onInboundEvent(event) {
+        routeInbound(event).catch((err) => {
+          log.error('Failed to route inbound event', {
+            sourceAdapter: adapter.channelType,
+            targetChannelType: event.channelType,
+            err,
+          });
+        });
+      },
+      onMetadata(platformId, name, isGroup) {
+        log.info('Channel metadata discovered', {
+          channelType: adapter.channelType,
+          platformId,
+          name,
+          isGroup,
+        });
+      },
+      onAction(questionId, selectedOption, userId) {
+        dispatchResponse({
+          questionId,
+          value: selectedOption,
+          userId,
+          channelType: adapter.channelType,
+          // platformId/threadId aren't surfaced by the current onAction
+          // signature — registered handlers look them up from the
+          // pending_question / pending_approval row.
+          platformId: '',
+          threadId: null,
+        }).catch((err) => {
+          log.error('Failed to handle question response', { questionId, err });
+        });
+      },
+    };
+  });
+
+  // 4. Delivery adapter bridge — dispatches to channel adapters by EXACT
+  // registry key (instance ?? channelType): a named instance with an
+  // offline adapter is never rerouted through a sibling bot. See
+  // createChannelDeliveryAdapter in channels/channel-registry.ts.
+  setDeliveryAdapter(createChannelDeliveryAdapter());
+
+  // 5. Start delivery polls
+  startActiveDeliveryPoll();
+  startSweepDeliveryPoll();
+  log.info('Delivery polls started');
+
+  // 6. Start host sweep
+  startHostSweep();
+  log.info('Host sweep started');
+
+  // 7. Start the `ncl` CLI socket server (data/ncl.sock).
+  await startCliServer();
+
+  log.info('NanoClaw running');
+}
+
+/** Graceful shutdown. */
+async function shutdown(signal: string): Promise<void> {
+  log.info('Shutdown signal received', { signal });
+  for (const cb of getShutdownCallbacks()) {
+    try {
+      await cb();
+    } catch (err) {
+      log.error('Shutdown callback threw', { err });
     }
-    logger.info('Using WhatsApp channel');
-    appChannel = new WhatsAppChannel({
-      onMessage: (chatJid, msg) => storeMessage(msg),
-      onChatMetadata: (chatJid, timestamp) => storeChatMetadata(chatJid, timestamp),
-      registeredGroups: () => registeredGroups,
-    });
   }
-
-  // Connect — resolves when first connected
-  await appChannel.connect();
-
-  // Start subsystems (independently of connection handler)
-  startSchedulerLoop({
-    registeredGroups: () => registeredGroups,
-    getSessions: () => sessions,
-    queue,
-    onProcess: (groupJid, proc, containerName, groupFolder) => queue.registerProcess(groupJid, proc, containerName, groupFolder),
-    sendMessage: async (jid, rawText) => {
-      const text = formatOutbound(appChannel, rawText);
-      if (text) await appChannel.sendMessage(jid, text);
-    },
-  });
-  startIpcWatcher({
-    sendMessage: (jid, text) => appChannel.sendMessage(jid, text),
-    registeredGroups: () => registeredGroups,
-    registerGroup,
-    syncGroupMetadata: (force) => {
-      if (appChannel.syncGroupMetadata) {
-        return appChannel.syncGroupMetadata(force);
-      }
-      return Promise.resolve();
-    },
-    getAvailableGroups,
-    writeGroupsSnapshot: (gf, im, ag, rj) => writeGroupsSnapshot(gf, im, ag, rj),
-  });
-  queue.setProcessMessagesFn(processGroupMessages);
-  recoverPendingMessages();
-  startMessageLoop();
+  stopDeliveryPolls();
+  stopHostSweep();
+  await stopCliServer();
+  try {
+    await teardownChannelAdapters();
+  } finally {
+    // Always reset on graceful shutdown — even if teardown threw, we got here
+    // via SIGTERM/SIGINT, not a crash, so the next start shouldn't be counted
+    // as one.
+    resetCircuitBreaker();
+    process.exit(0);
+  }
 }
 
-// Guard: only run when executed directly, not when imported by tests
-const isDirectRun =
-  process.argv[1] &&
-  new URL(import.meta.url).pathname === new URL(`file://${process.argv[1]}`).pathname;
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
-if (isDirectRun) {
-  main().catch((err) => {
-    logger.error({ err }, 'Failed to start NanoClaw');
-    process.exit(1);
-  });
-}
+main().catch((err) => {
+  log.fatal('Startup failed', { err });
+  process.exit(1);
+});

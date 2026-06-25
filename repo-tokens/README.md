@@ -12,7 +12,7 @@ A GitHub Action that calculates the size of your codebase in terms of tokens and
 ## Usage
 
 ```yaml
-- uses: qwibitai/nanoclaw/repo-tokens@v1
+- uses: nanocoai/nanoclaw/repo-tokens@v1
   with:
     include: 'src/**/*.ts'
     exclude: 'src/**/*.test.ts'
@@ -27,6 +27,14 @@ The badge color reflects what percentage of an LLMs context window the codebase 
 Small codebases were always a good thing. With coding agents, there's now a huge advantage to having a codebase small enough that an agent can hold the full thing in context.
 
 This badge gives some indication of how easy it will be to work with an agent on the codebase, and will hopefully be a visual reminder to avoid bloat.
+
+## Examples
+
+Repos using repo-tokens:
+
+| Repo | Badge |
+|------|-------|
+| [NanoClaw](https://github.com/nanocoai/NanoClaw) | ![tokens](https://raw.githubusercontent.com/nanocoai/NanoClaw/main/repo-tokens/badge.svg) |
 
 ### Full workflow example
 
@@ -51,7 +59,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - uses: qwibitai/nanoclaw/repo-tokens@v1
+      - uses: nanocoai/nanoclaw/repo-tokens@v1
         id: tokens
         with:
           include: 'src/**/*.ts'
